@@ -1,0 +1,112 @@
+# detector.py
+import mimetypes, struct, zlib, pathlib
+MAGIC = {
+  b"\x1F\x8B": "gzip", b"\x42\x5A\x68": "bz2", b"\xFD\x37\x7A\x58\x5A\x00": "xz",
+  b"\x28\xB5\x2F\xFD": "zstd", b"\xFF\xD8\xFF": "jpeg", b"\x89PNG\r\n\x1a\n": "png"
+}
+def magic_type(path: str) -> str|None:
+    with open(path,'rb') as f:
+        head=f.read(16)
+    for m,t in MAGIC.items():
+        if head.startswith(m): return t
+    return None
+
+def sample_stats(path: str, n=256*1024):
+    import math
+    with open(path,'rb') as f: buf = f.read(n)
+    if not buf: return {"entropy":0,"text_ratio":0,"nl":0}
+    # entropy
+    from collections import Counter
+    c=Counter(buf); total=len(buf)
+    H=-sum((v/total)*math.log2(v/total) for v in c.values())
+    # crude text test
+    text_ratio = sum(32<=b<=126 or b in (9,10,13) for b in buf)/total
+    nl = buf.count(b'\n')
+    return {"entropy":H,"text_ratio":text_ratio,"nl":nl}
+
+def guess_mime(path: str) -> str:
+    mt, _ = mimetypes.guess_type(path)
+    return mt or "application/octet-stream"
+# strategy.py
+from dataclasses import dataclass
+@dataclass
+class Plan: codec:str; level:int; chunk:int; threads:int; store:bool=False; dict_id:str|None=None
+
+def choose_strategy(path:str, mode="auto"):
+    from detector import magic_type, sample_stats, guess_mime
+    mt = magic_type(path)
+    if mt in {"gzip","bz2","xz","zstd"}: return Plan(codec="store", level=0, chunk=0, threads=0, store=True)
+    mime = guess_mime(path); s = sample_stats(path)
+    texty = s["text_ratio"]>0.7 and s["entropy"]<7.7
+    if mode=="fast": return Plan(codec="zstd", level=3, chunk=1024*1024, threads=0)
+    if mode=="max":  return Plan(codec="lzma", level=7, chunk=1024*1024, threads=0)
+    if "text" in mime or texty or mime in {"application/json","text/csv"}:
+        return Plan(codec="zstd", level=8, chunk=4*1024*1024, threads=0)
+    if mime.startswith("image/") or mime.startswith("video/"):
+        return Plan(codec="store", level=0, chunk=0, threads=0, store=True)
+    # default balanced
+    return Plan(codec="zstd", level=6, chunk=2*1024*1024, threads=0)
+# compress.py
+from concurrent.futures import ThreadPoolExecutor
+import gzip, bz2, lzma, brotli, zstandard as zstd, pathlib, os, hashlib, json, time
+from strategy import choose_strategy, Plan
+
+def sha256_file(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        for b in iter(lambda: f.read(1<<20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+def compress_file(src: str, dst: str|None=None, mode="auto") -> dict:
+    p=pathlib.Path(src); plan = choose_strategy(src, mode)
+    if plan.store:
+        dst = dst or (str(p)+".store")
+        os.link(src, dst) if hasattr(os, "link") else open(dst,"wb").write(open(src,"rb").read())
+        return _manifest(src, dst, plan, 0)
+
+    if plan.codec=="zstd":
+        cctx = zstd.ZstdCompressor(level=plan.level, threads=plan.threads or 0)
+        dst = dst or (str(p)+".zst")
+        with open(src,'rb') as fi, open(dst,'wb') as fo:
+            with cctx.stream_writer(fo) as zw:
+                for chunk in iter(lambda: fi.read(plan.chunk), b''):
+                    zw.write(chunk)
+        return _manifest(src, dst, plan, 0)
+
+    if plan.codec=="brotli":
+        dst = dst or (str(p)+".br")
+        enc = brotli.Compressor(quality=plan.level)
+        with open(src,'rb') as fi, open(dst,'wb') as fo:
+            for chunk in iter(lambda: fi.read(plan.chunk), b''):
+                fo.write(enc.process(chunk))
+            fo.write(enc.finish())
+        return _manifest(src, dst, plan, 0)
+
+    if plan.codec=="gzip":
+        dst = dst or (str(p)+".gz")
+        with open(src,'rb') as fi, gzip.open(dst,'wb', compresslevel=plan.level) as fo:
+            for chunk in iter(lambda: fi.read(plan.chunk), b''): fo.write(chunk)
+        return _manifest(src, dst, plan, 0)
+
+    if plan.codec=="bz2":
+        dst = dst or (str(p)+".bz2")
+        with open(src,'rb') as fi, bz2.open(dst,'wb', compresslevel=min(9,plan.level)) as fo:
+            for chunk in iter(lambda: fi.read(plan.chunk), b''): fo.write(chunk)
+        return _manifest(src, dst, plan, 0)
+
+    if plan.codec=="lzma":
+        dst = dst or (str(p)+".xz")
+        with open(src,'rb') as fi, lzma.open(dst,'wb', preset=min(9,plan.level)) as fo:
+            for chunk in iter(lambda: fi.read(plan.chunk), b''): fo.write(chunk)
+        return _manifest(src, dst, plan, 0)
+
+def _manifest(src, dst, plan: Plan, dict_size):
+    man = {
+        "source": src, "output": dst, "codec": plan.codec, "level": plan.level,
+        "chunk": plan.chunk, "dict_id": plan.dict_id, "sha256": sha256_file(src),
+        "orig_bytes": pathlib.Path(src).stat().st_size, "out_bytes": pathlib.Path(dst).stat().st_size
+    }
+    with open(str(dst)+".dfc.json","w") as f: json.dump(man,f,indent=2)
+    return man
+
